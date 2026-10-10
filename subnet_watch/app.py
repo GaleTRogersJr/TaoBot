@@ -9,6 +9,11 @@ from .core import Sample, Alert, evaluate, make_alert, price_text, change_text, 
 from .providers import DemoProvider, TaostatsProvider, ProviderError
 from .storage import Store
 from .notifications import Notifications
+from .credentials import CredentialStore, CredentialError
+from .polling import PollingPolicy, DEFAULT_INTERVAL, monthly_estimate
+from dataclasses import replace
+from .candles import CandleHistory
+from .chart import CandleChart
 
 BG = "#f4f6fa"
 INK = "#182536"
@@ -41,26 +46,44 @@ def work_area(root):
 
 
 class App:
-    def __init__(self, root, data_path, notifications=True):
+    def __init__(self, root, data_path, notifications=True, credentials=None, provider_factory=TaostatsProvider):
         self.root = root
         self.store = Store(data_path)
-        self.samples = {}
+        self.credentials = credentials or CredentialStore.for_database(data_path)
+        self.provider_factory = provider_factory
+        self.credential_error = ""
+        self.api_key = ""
+        try:
+            self.api_key = self.credentials.load() or ""
+        except CredentialError as error:
+            self.credential_error = str(error)
         self.alerts = self.store.alerts()
         # A restart is a monitoring gap; preserved armed/done state prevents duplicates.
         for alert in self.alerts:
             alert.gap = True
+        self.mode = self.store.setting("mode", "taostats" if self.credentials.exists else "demo")
         self.provider = DemoProvider()
-        self.mode = self.store.setting("mode", "demo")
         if self.mode == "taostats":
-            self.provider = None  # Credentials intentionally never persist.
-        self.interval = self.store.setting("interval", 60)
-        self.api_key = ""
+            names, metadata_at = self.store.metadata("taostats")
+            self.provider = self.provider_factory(self.api_key, names=names, metadata_at=metadata_at) if self.api_key else None
+        self.interval = self.store.setting("interval", DEFAULT_INTERVAL)
+        self.policy = PollingPolicy(self.interval)
+        if self.mode == "taostats":
+            self.policy.restore(self.store.setting("polling"))
+        self.samples = {s.key: s for s in self.store.cached_catalog(self.mode)}
+        self.details_dialog = None
+        self.candle_history = CandleHistory()
         self.events = queue.Queue()
+        self.chart_events = queue.Queue()
         self.busy = False
         self.generation = 0
         self.next_refresh = 0
-        self.error = ""
-        self.last_fetch = None
+        self.error = self.credential_error
+        if self.mode == "taostats" and self.policy.auth_failed and not self.error:
+            self.error = "API access was rejected. Replace the key in Settings before reconnecting."
+        elif self.mode == "taostats" and self.policy.failures and not self.error:
+            self.error = "Connection failed previously. Automatic reconnection will continue after the retry wait."
+        self.last_fetch = max((s.observed_time for s in self.samples.values()), default=None)
         self.closed = False
         self.age_tick = 0
         self.picked = set()
@@ -68,7 +91,7 @@ class App:
         self._style()
         self._build()
         self.render()
-        root.after(100, self.tick)
+        self.tick_timer = root.after(100, self.tick)
         root.protocol("WM_DELETE_WINDOW", self.close)
 
     def _style(self):
@@ -165,6 +188,7 @@ class App:
         actions.grid(row=4, column=0, sticky="ew")
         ttk.Button(actions, text="+ Price alert", style="Primary.TButton", command=self.edit_alert).pack(side="left")
         ttk.Button(actions, text="Manage alerts", command=lambda: self.tabs.select(1)).pack(side="left", padx=8)
+        ttk.Button(actions, text="Details", command=self.subnet_details).pack(side="left")
         ttk.Button(actions, text="Remove", command=self.remove_selected).pack(side="right")
         self.watch_empty = ttk.Label(main, style="Card.TLabel", text="Add subnets from the list to start watching.")
         self.watch_empty.grid(row=5, column=0, sticky="w", pady=(8, 0))
@@ -296,7 +320,7 @@ class App:
         for key, item in watched.items():
             s = self.mode_samples().get(key) or self.missing_sample(key, item)
             tag = "missing" if not s.fresh(now) else "up" if s.change_24h is not None and s.change_24h >= 0 else "down" if s.change_24h is not None else "missing"
-            price = price_text(s.price) + (" · stale" if s.price is not None and not s.fresh(now) else "")
+            price = price_text(s.price) + (" · cached" if s.cached else " · stale" if s.price is not None and not s.fresh(now) else "")
             count = sum(a.key == key and a.enabled and not a.done for a in self.alerts)
             values = (f"{s.name} · SN {s.netuid}", price, change_text(s.change_24h), count)
             if self.watch.exists(key):
@@ -310,6 +334,7 @@ class App:
         else:
             self.watch_empty.grid()
         self.render_detail()
+        self.update_details()
 
     def render_detail(self):
         keys = self.watch.selection()
@@ -318,10 +343,96 @@ class App:
             return
         s = self.mode_samples().get(keys[0])
         if s:
-            state = "Fresh sample" if s.fresh(time.time()) else "Stale / invalid sample · alerts paused for this subnet"
+            state = "Cached · waiting for live data" if s.cached else "Fresh sample" if s.fresh(time.time()) else "Stale / invalid sample · alerts paused for this subnet"
             self.detail.configure(text=f"{state} · Sample: {local_time(s.source_time)}")
         else:
             self.detail.configure(text="Current price unavailable. Waiting for a valid provider sample.")
+
+    def subnet_details(self):
+        keys = self.watch.selection() or self.catalog.selection()
+        if not keys:
+            self.notice.configure(text="Select a subnet in Watch or the catalog, then choose Details.")
+            return
+        if self.details_dialog and self.details_dialog.winfo_exists():
+            self.details_dialog.destroy()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Subnet details")
+        dialog.configure(bg=BG)
+        dialog.transient(self.root)
+        self.position_dialog(dialog, 850, 750)
+        frame = ttk.Frame(dialog, padding=22)
+        frame.pack(fill="both", expand=True)
+        self.details_title = ttk.Label(frame, font=("Segoe UI", 17, "bold"))
+        self.details_title.pack(anchor="w")
+        self.details_state = ttk.Label(frame, style="Muted.TLabel", wraplength=640)
+        self.details_state.pack(fill="x", pady=12)
+        ttk.Button(frame, text="Close", command=dialog.destroy).pack(side="bottom", anchor="e", pady=(14, 0))
+        notebook = ttk.Notebook(frame)
+        notebook.pack(fill="both", expand=True)
+        chart_tab, metrics_tab = ttk.Frame(notebook), ttk.Frame(notebook)
+        notebook.add(chart_tab, text="Price chart")
+        notebook.add(metrics_tab, text="Metrics")
+        self.details_tree = self.tree(metrics_tab, ("metric", "value"), ("METRIC", "VALUE"), (330, 265), height=8)
+        self.details_tree.master.pack(fill="both", expand=True)
+        self.details_dialog, self.details_key = dialog, keys[0]
+        generation, provider = self.generation, self.provider
+        sample = self.mode_samples().get(keys[0])
+        def available():
+            if generation != self.generation:
+                return "Connection changed. Reopen Details to load this chart."
+            if not sample or sample.source != "taostats":
+                return "Live candle charts are available for Taostats subnets. Demo data has no market history."
+            if not provider or not hasattr(provider, "fetch_candles"):
+                return "Connect to Taostats in Settings to load candle history."
+            if self.policy.auth_failed:
+                return "API access was rejected. Replace the key in Settings."
+            if self.policy.failures and time.time() < self.policy.next_allowed:
+                return "Chart requests paused until " + local_time(self.policy.next_allowed) + "."
+            return ""
+        def load_history(chosen, force):
+            try:
+                return self.candle_history.load(provider, sample.netuid, chosen, force)
+            except ProviderError as error:
+                if error.status == 429:
+                    # Persist the provider wait even if Details closes mid-request.
+                    self.chart_events.put((generation, error))
+                raise
+        self.details_chart = CandleChart(chart_tab, load_history, available, lambda error: None)
+        self.details_chart.pack(fill="both", expand=True)
+        self.update_details()
+        self.details_chart.load()
+        return dialog
+
+    def update_details(self):
+        if not self.details_dialog or not self.details_dialog.winfo_exists():
+            return
+        s = self.mode_samples().get(self.details_key)
+        if not s:
+            self.details_title.configure(text="Subnet unavailable")
+            self.details_state.configure(text="This subnet is absent from the latest complete catalog. Its alerts are paused.")
+            self.details_tree.delete(*self.details_tree.get_children())
+            return
+        self.details_title.configure(text=f"{s.name} · SN {s.netuid}")
+        state = "Cached · waiting for live data" if s.cached else "Fresh sample" if s.fresh(time.time()) else "Stale / invalid sample · alerts paused"
+        self.details_state.configure(text=f"{state} · Source: {s.source}\nSample: {local_time(s.source_time)} · Observed: {local_time(s.observed_time)}")
+        rows = [("Price · TAO per alpha", price_text(s.price)), ("24h price change", change_text(s.change_24h))]
+        fields = [("1h price change", "price_change_1_hour", "%"), ("7d price change", "price_change_1_week", "%"),
+                  ("30d price change", "price_change_1_month", "%"), ("Pool liquidity", "liquidity", "TAO"),
+                  ("Market capitalization", "market_cap", "TAO"), ("TAO reserve", "total_tao", "TAO"),
+                  ("Total alpha", "total_alpha", "alpha"), ("Alpha reserve in pool", "alpha_in_pool", "alpha"),
+                  ("Alpha staked", "alpha_staked", "alpha"), ("24h total volume", "tao_volume_24_hr", "TAO"),
+                  ("24h buy volume", "tao_buy_volume_24_hr", "TAO"), ("24h sell volume", "tao_sell_volume_24_hr", "TAO"),
+                  ("24h buys", "buys_24_hr", ""), ("24h sells", "sells_24_hr", ""),
+                  ("24h buyers", "buyers_24_hr", ""), ("24h sellers", "sellers_24_hr", ""), ("Source block", "block_number", "")]
+        for label, key, unit in fields:
+            value = s.metrics.get(key)
+            display = "Unavailable" if value is None else change_text(value) if unit == "%" else price_text(value) + (" " + unit if unit else "")
+            rows.append((label, display))
+        for i, row in enumerate(rows):
+            if self.details_tree.exists(str(i)):
+                self.details_tree.item(str(i), values=row)
+            else:
+                self.details_tree.insert("", "end", iid=str(i), values=row)
 
     def render_status(self):
         if self.mode == "demo":
@@ -335,6 +446,8 @@ class App:
             color, ink = "#ffebec", RED
         elif self.busy:
             text += "  |  Refreshing…"
+        elif any(s.cached for s in self.mode_samples().values()):
+            text += "  |  Cached catalog · waiting for current live observations; cached alerts are paused."
         elif self.samples and any(not s.fresh(time.time()) for s in self.mode_samples().values()):
             text += "  |  Some data is stale or invalid; those alerts are paused."
         elif not self.mode_samples():
@@ -342,16 +455,24 @@ class App:
         warning = getattr(self.provider, "warning", "")
         if warning and not self.error:
             text += "  |  " + warning
+        if self.mode == "taostats" and self.policy.next_allowed > time.time() and (self.policy.failures or self.policy.auth_failed):
+            text += "  |  Retry no earlier than " + local_time(self.policy.next_allowed)
         self.banner.configure(text=text, bg=color, fg=ink)
         self.footer.configure(text=f"Last fetch: {local_time(self.last_fetch)}   ·   Refresh: {self.interval}s   ·   Monitoring runs while this program is open and your PC is awake.", wraplength=max(700, self.root.winfo_width()-70))
 
-    def refresh(self):
+    def refresh(self, automatic=False):
         if self.busy:
             return
         if self.provider is None:
-            self.error = "API key needed. Open Settings to connect."
+            self.error = self.credential_error or "API key needed. Open Settings to connect."
             self.render_status()
             return
+        if self.mode == "taostats":
+            allowed = self.policy.automatic_allowed(time.time()) if automatic else self.policy.manual_allowed(time.time())
+            if not allowed:
+                self.notice.configure(text="API access rejected. Replace the key in Settings." if self.policy.auth_failed else
+                                      "Refresh waits until " + local_time(self.policy.next_allowed) + " to respect the provider cadence/backoff.")
+                return
         self.busy = True
         self.render_status()
         generation, provider = self.generation, self.provider
@@ -362,7 +483,7 @@ class App:
                 self.events.put((generation, result, None))
             except Exception as exc:
                 # Known errors carry safe explanations; never render secret-bearing traces.
-                self.events.put((generation, None, str(exc) if isinstance(exc, ProviderError) else "Provider returned unexpected data. Refresh could not complete."))
+                self.events.put((generation, None, exc if isinstance(exc, ProviderError) else ProviderError("Provider returned unexpected data. Refresh could not complete.")))
         threading.Thread(target=work, daemon=True).start()
 
     def apply_samples(self, samples):
@@ -370,10 +491,14 @@ class App:
         # Reject regressed/duplicate timestamps for display as well as evaluation.
         for key, s in list(incoming.items()):
             old = self.samples.get(key)
-            if old and old.source_time is not None and s.source_time is not None and s.source_time <= old.source_time:
-                incoming[key] = old
+            if old and old.source_time is not None and s.source_time is not None:
+                if s.source_time < old.source_time:
+                    incoming[key] = replace(old, cached=True)
+                elif s.source_time == old.source_time and not old.cached:
+                    incoming[key] = old
         self.samples = incoming
         now, events = time.time(), []
+        self.store.cache_catalog(self.mode, list(self.samples.values()), now)
         for a in self.alerts:
             s = self.samples.get(a.key)
             if s is None:
@@ -391,6 +516,10 @@ class App:
                 self.notify.show("GR Subnet Watch · Price alert", body)
         self.error = ""
         self.last_fetch = now
+        if self.mode == "taostats":
+            self.store.save_metadata("taostats", self.provider.names, self.provider.metadata_at)
+            self.store.set_setting("pool_pages", self.provider.page_counts.get(self.provider.pool_path, 1))
+            self.store.set_setting("metadata_pages", self.provider.page_counts.get(self.provider.identity_path, 1))
         self.render()
 
     def tick(self):
@@ -404,13 +533,32 @@ class App:
                 self.busy = False
                 self.next_refresh = time.time() + self.interval
                 if error:
-                    self.error = error
+                    self.error = str(error)
+                    if self.mode == "taostats":
+                        self.policy.fail(error, time.time())
+                        self.store.set_setting("polling", self.policy.to_dict())
                     for a in self.alerts:
                         a.gap = True
                     self.store.persist_evaluation(self.alerts, [])
                     self.render_status()
                 else:
                     self.apply_samples(samples)
+                    if self.mode == "taostats":
+                        advisory = getattr(self.provider, "advisory_error", None)
+                        if advisory:
+                            self.policy.fail(advisory, time.time())
+                        else:
+                            self.policy.success(time.time())
+                        self.store.set_setting("polling", self.policy.to_dict())
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                generation, error = self.chart_events.get_nowait()
+                if generation == self.generation and self.mode == "taostats":
+                    self.policy.fail(error, time.time())
+                    self.store.set_setting("polling", self.policy.to_dict())
+                    self.error = "Taostats rate limit reached while loading chart history."
         except queue.Empty:
             pass
         if self.notify:
@@ -421,15 +569,15 @@ class App:
                     self.root.lift()
             except queue.Empty:
                 pass
-        if not self.busy and time.time() >= self.next_refresh:
+        if not self.busy and time.time() >= self.next_refresh and (self.mode != "taostats" or self.policy.automatic_allowed(time.time())):
             self.next_refresh = time.time() + self.interval
-            self.refresh()
+            self.refresh(automatic=True)
         self.render_status()
         self.render_detail()
         if int(time.time()) != self.age_tick:
             self.age_tick = int(time.time())
             self.render_watch()
-        self.root.after(250, self.tick)
+        self.tick_timer = self.root.after(250, self.tick)
 
     def selected_alert(self):
         ids = self.alert_tree.selection()
@@ -553,64 +701,124 @@ class App:
     def settings(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("Data & settings")
-        dialog.geometry("580x760")
+        dialog.geometry("640x790")
         dialog.resizable(False, False)
         dialog.configure(bg=BG)
         dialog.transient(self.root)
-        self.position_dialog(dialog, 580, 760)
+        self.position_dialog(dialog, 640, 790)
         dialog.grab_set()
-        frame = ttk.Frame(dialog, padding=26)
+        frame = ttk.Frame(dialog, padding=22)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="Data & settings", font=("Segoe UI", 18, "bold")).pack(anchor="w")
-        ttk.Label(frame, text="Choose a data source", style="Muted.TLabel").pack(anchor="w", pady=(15, 8))
+        ttk.Label(frame, text="Choose a data source", style="Muted.TLabel").pack(anchor="w", pady=(10, 6))
         mode = tk.StringVar(value="Demo data" if self.mode == "demo" else "Taostats API")
         ttk.Combobox(frame, values=("Demo data", "Taostats API"), state="readonly", textvariable=mode).pack(fill="x")
-        ttk.Label(frame, text="Taostats API key (kept only for this session)").pack(anchor="w", pady=(18, 7))
-        key = tk.StringVar(value=self.api_key)
-        ttk.Entry(frame, textvariable=key, show="•").pack(fill="x")
-        ttk.Label(frame, text="Refresh interval · seconds (30–3600)").pack(anchor="w", pady=(18, 7))
+        ttk.Label(frame, text="New / replacement Taostats key · leave blank to keep current").pack(anchor="w", pady=(12, 6))
+        key = tk.StringVar(value="")
+        key_entry = ttk.Entry(frame, textvariable=key, show="•")
+        key_entry.pack(fill="x")
+        remember = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="Remember securely for this Windows user", variable=remember).pack(anchor="w", pady=(8, 2))
+        key_status = ttk.Label(frame, text="Saved protected credential available." if self.credentials.exists else
+                               "Session credential available." if self.api_key else "No API key connected.", style="Muted.TLabel")
+        key_status.pack(anchor="w")
+        ttk.Button(frame, text="Forget saved key & disconnect", command=lambda: forget()).pack(anchor="w", pady=(6, 8))
+        ttk.Label(frame, text=f"Refresh interval · seconds (30–3600) · Default: {DEFAULT_INTERVAL}").pack(anchor="w", pady=(6, 6))
         interval = tk.StringVar(value=str(self.interval))
-        dialog._variables = [mode, key, interval]
+        dialog._variables = [mode, key, interval, remember]
         ttk.Entry(frame, textvariable=interval).pack(fill="x")
-        ttk.Label(frame, text="API use must fit your Taostats plan. Each refresh pages through all current pools; subnet names refresh hourly. Live and demo watchlists and alerts are separate.",
-                  style="Muted.TLabel", wraplength=495).pack(anchor="w", pady=16)
-        native = bool(self.notify and self.notify.available)
-        ttk.Label(frame, text="Windows tray notifications available." if native else "Windows notifications unavailable; alerts appear in-app and in History.",
-                  style="Muted.TLabel", wraplength=495).pack(anchor="w")
-        ttk.Button(frame, text="Test notification", command=self.test_notification).pack(anchor="w", pady=12)
-        ttk.Label(frame, text="Monitoring runs while the program is open or hidden to tray and your PC is awake. Closing it stops monitoring. Windows may suppress banners depending on your notification settings.",
-                  style="Muted.TLabel", wraplength=495).pack(anchor="w")
-        feedback = ttk.Label(frame, foreground=RED, wraplength=495)
-        feedback.pack(anchor="w", pady=10)
-
-        def save():
+        budget = ttk.Label(frame, style="Muted.TLabel", wraplength=585)
+        budget.pack(anchor="w", pady=(10, 8))
+        def update_budget(*_):
             try:
                 seconds = int(interval.get())
                 if not 30 <= seconds <= 3600:
-                    raise ValueError("Refresh interval must be between 30 and 3600 seconds.")
+                    raise ValueError()
+                estimate = monthly_estimate(self.store.setting("pool_pages", 1), self.store.setting("metadata_pages", 1), seconds)
+                budget.configure(text=f"Estimated {estimate:,} requests / 31 days of continuous monitoring. Free includes 10,000 credits/month; 30-second polling exceeds that allowance. Assumes 1 credit/request and last observed page counts. Names refresh every 6 hours; chart loads and retries add usage.")
+            except ValueError:
+                budget.configure(text="Enter a valid interval to estimate monthly requests.")
+        interval.trace_add("write", update_budget)
+        update_budget()
+        native = bool(self.notify and self.notify.available)
+        ttk.Label(frame, text="Windows tray notifications available." if native else "Windows notifications unavailable; alerts appear in-app and in History.",
+                  style="Muted.TLabel", wraplength=585).pack(anchor="w")
+        ttk.Button(frame, text="Test notification", command=self.test_notification).pack(anchor="w", pady=8)
+        ttk.Label(frame, text="Monitoring needs this program running and your PC awake/online. Polling cannot make Taostats publish prices faster. Data becomes stale after 3 minutes; rate limits and outages can delay updates. Windows may suppress banners.",
+                  style="Muted.TLabel", wraplength=585).pack(anchor="w")
+        feedback = ttk.Label(frame, foreground=RED, wraplength=585)
+        feedback.pack(anchor="w", pady=6)
+
+        def forget():
+            try:
+                self.forget_credentials()
+                key.set("")
+                key_status.configure(text="Saved key forgotten. Live monitoring disconnected.")
+            except CredentialError as error:
+                feedback.configure(text=str(error))
+
+        def save():
+            try:
                 chosen = "demo" if mode.get() == "Demo data" else "taostats"
-                provider = DemoProvider() if chosen == "demo" else TaostatsProvider(key.get())
-                self.generation += 1
-                self.busy = False
-                self.mode, self.provider, self.interval = chosen, provider, seconds
-                self.api_key = key.get().strip() if chosen == "taostats" else ""
-                self.samples = {}
-                self.picked.clear()
-                self.last_fetch, self.error = None, ""
-                self.store.set_setting("mode", chosen)
-                self.store.set_setting("interval", seconds)
-                for a in self.alerts:
-                    a.gap = True
-                self.next_refresh = 0
+                self.configure_connection(chosen, key.get(), remember.get(), int(interval.get()))
+                key.set("")
                 dialog.destroy()
                 self.render()
-            except (ValueError, ProviderError) as exc:
+            except (ValueError, ProviderError, CredentialError) as exc:
                 feedback.configure(text=str(exc) if "invalid literal" not in str(exc) else "Enter a whole number of seconds.")
         row = ttk.Frame(frame)
         row.pack(side="bottom", fill="x", before=frame.winfo_children()[0])
         ttk.Button(row, text="Save & connect", style="Primary.TButton", command=save).pack(side="right")
         ttk.Button(row, text="Cancel", command=dialog.destroy).pack(side="right", padx=8)
         return dialog
+
+    def configure_connection(self, chosen, new_key, remember, seconds):
+        if chosen not in ("demo", "taostats") or not 30 <= seconds <= 3600:
+            raise ValueError("Refresh interval must be between 30 and 3600 seconds.")
+        usable_key = new_key.strip() or self.api_key
+        changed_key = usable_key != self.api_key
+        previous_policy = self.policy.to_dict() if self.mode == "taostats" else self.store.setting("polling")
+        if self.mode == "taostats" and chosen == "demo":
+            self.store.set_setting("polling", previous_policy)
+        names, metadata_at = self.store.metadata("taostats")
+        provider = DemoProvider() if chosen == "demo" else self.provider_factory(usable_key, names=names, metadata_at=metadata_at)
+        if chosen == "taostats":
+            if remember:
+                self.credentials.save(usable_key)
+            else:
+                self.credentials.delete()
+        self.generation += 1
+        self.busy = False
+        self.mode, self.provider, self.interval = chosen, provider, seconds
+        self.api_key = usable_key if chosen == "taostats" else self.api_key
+        self.samples = {s.key: s for s in self.store.cached_catalog(chosen)}
+        self.picked.clear()
+        self.last_fetch = max((s.observed_time for s in self.samples.values()), default=None)
+        self.error = self.credential_error = ""
+        self.store.set_setting("mode", chosen)
+        self.store.set_setting("interval", seconds)
+        self.policy = PollingPolicy(seconds)
+        if chosen == "taostats":
+            if not changed_key:
+                self.policy.restore(previous_policy)
+            self.store.set_setting("polling", self.policy.to_dict())
+        for a in self.alerts:
+            a.gap = True
+        self.next_refresh = 0
+
+    def forget_credentials(self):
+        self.credentials.delete()
+        self.api_key = ""
+        self.generation += 1
+        self.busy = False
+        self.credential_error = ""
+        if self.mode == "taostats":
+            self.provider = None
+            self.samples = {key: replace(s, cached=True) for key, s in self.samples.items()}
+            self.error = "API key forgotten. Enter a key in Settings to reconnect."
+        self.policy = PollingPolicy(self.interval)
+        self.store.set_setting("polling", None)
+        self.render()
 
     def test_notification(self):
         sent = bool(self.notify and self.notify.show("GR Subnet Watch · Test", "Test notification. Real alert events also remain in History."))
@@ -631,6 +839,7 @@ class App:
 
     def close(self):
         self.closed = True
+        self.root.after_cancel(self.tick_timer)
         if self.notify:
             self.notify.close()
         self.store.close()
@@ -645,7 +854,9 @@ def run(data_path=None, verify_output=None):
         def finish_verification():
             import json
             report = {"title": root.title(), "viewport": [root.winfo_width(), root.winfo_height()],
-                      "demo_samples_loaded": len(app.samples), "native_tray": bool(app.notify and app.notify.available)}
+                      "mode": app.mode, "catalog_samples_loaded": len(app.samples),
+                      "cached_samples": sum(s.cached for s in app.samples.values()),
+                      "native_tray": bool(app.notify and app.notify.available)}
             Path(verify_output).write_text(json.dumps(report, indent=2))
             app.close()
         root.after(1500, finish_verification)

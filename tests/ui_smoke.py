@@ -15,6 +15,7 @@ from subnet_watch.providers import DemoProvider
 from PIL import Image, ImageGrab
 import ctypes
 from ctypes import wintypes as w
+from decimal import Decimal
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -91,6 +92,13 @@ app.picked.update(["demo:1", "demo:2", "demo:3"])
 app.add_selected()
 app.watch.selection_set("demo:1")
 root.update()
+app.samples["demo:1"].metrics = {"liquidity": Decimal("560.550190686"), "tao_volume_24_hr": Decimal("62.023561032"), "block_number": 123}
+details = app.subnet_details()
+details_notebook = app.details_chart.master.master
+details_notebook.select(1)
+assert app.details_tree.item("5")["values"][1] == "560.550190686 TAO"
+capture(details, "subnet-details.png")
+details.destroy()
 dialog = app.edit_alert()
 entries = [w for w in descendants(dialog) if type(w) is ttk.Entry]
 entries[0].insert(0, "0.3")
@@ -158,9 +166,10 @@ capture(root, "large-watch-small-window.png")
 report = {"watch_rows": len(app.watch.get_children()), "viewport": [root.winfo_width(), root.winfo_height()],
           "watch_scroll_fraction": app.watch.yview(), "alerts_created_through_form": 2,
           "percentage_reference_saved": True, "either_direction_saved_and_reopened": True, "pause_resume": True,
+          "details_metrics_displayed": True, "free_plan_default_interval": app.interval,
           "windows_tray_registered": bool(app.notify and app.notify.available),
           "native_banner_delivery": "Not visually verified; OS may suppress banners",
-          "screenshots": ["watch-window.png", "alerts-window.png", "alert-editor.png", "percentage-either-editor.png", "settings-window.png", "large-watch-small-window.png"]}
+          "screenshots": ["watch-window.png", "alerts-window.png", "alert-editor.png", "percentage-either-editor.png", "settings-window.png", "subnet-details.png", "large-watch-small-window.png"]}
 app.close()
 (OUT/"ui-smoke-report.json").write_text(json.dumps(report, indent=2))
 print(json.dumps(report, indent=2))

@@ -7,4 +7,6 @@ qa/
 !.env.example
 *.sqlite3
 *.sqlite3-*
+*.dpapi
+*.dpapi.new
 *.log

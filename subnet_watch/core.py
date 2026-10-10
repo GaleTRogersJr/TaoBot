@@ -41,7 +41,10 @@ def change_text(value):
 def local_time(value):
     if not value:
         return "Unavailable"
-    local = datetime.fromtimestamp(value).astimezone()
+    try:
+        local = datetime.fromtimestamp(value).astimezone()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "Timestamp outside supported range"
     offset = local.strftime("%z")
     return local.strftime("%b %d, %H:%M:%S") + f" (UTC{offset[:3]}:{offset[3:]})"
 
@@ -56,12 +59,27 @@ class Sample:
     source_time: float | None
     observed_time: float
     source: str
+    metrics: dict = field(default_factory=dict)
+    cached: bool = False
 
     def fresh(self, now):
-        return (self.price is not None and self.price.is_finite() and self.price > 0
+        return (not self.cached and self.price is not None and self.price.is_finite() and self.price > 0
                 and self.source_time is not None and math.isfinite(self.source_time)
                 and -30 <= now - self.source_time <= STALE_SECONDS
                 and -30 <= now - self.observed_time <= STALE_SECONDS)
+
+    def to_dict(self):
+        return {"key": self.key, "netuid": self.netuid, "name": self.name,
+                "price": str(self.price) if self.price is not None else None,
+                "change_24h": str(self.change_24h) if self.change_24h is not None else None,
+                "source_time": self.source_time, "observed_time": self.observed_time, "source": self.source,
+                "metrics": {key: str(value) if isinstance(value, Decimal) else value for key, value in self.metrics.items()}}
+
+    @classmethod
+    def from_dict(cls, body, cached=True):
+        return cls(body["key"], body["netuid"], body["name"], number(body["price"]), number(body["change_24h"]),
+                   body["source_time"], body["observed_time"], body["source"],
+                   {key: number(value) if isinstance(value, str) else value for key, value in body.get("metrics", {}).items()}, cached)
 
 
 @dataclass

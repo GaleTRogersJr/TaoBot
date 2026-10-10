@@ -1,6 +1,6 @@
 # GR Software — Bittensor Subnet Trading Bot
 
-Status: first Windows monitor and alerts prototype implemented. See [README.md](README.md) for current features and limitations, and [ROADMAP.md](ROADMAP.md) for the proposed delivery sequence.
+Status: Windows monitor and alerts prototype now connects automatically to live Taostats prices and pool metrics using a Windows-user-protected saved credential. Each subnet's Details page includes on-demand TAO/alpha candlestick history with selectable timeframes and hover inspection. See [README.md](README.md) for current features and limitations, and [ROADMAP.md](ROADMAP.md) for the proposed delivery sequence.
 
 ## Ownership
 
@@ -27,6 +27,8 @@ Actual SDK versions, network capabilities, and quote behavior must be verified b
 ## Confirmed first release and proposed later milestones
 
 Deliver a Windows desktop program with a UI, subnet information from Taostats or a comparable provider, and configurable price alerts for any supported subnet. This first release precedes paper trading and AI work. A mobile app may follow later.
+
+Current increment: unlimited Watch selection, fixed-price and percentage rise/fall/either-direction alerts, TAO/alpha prices, signed 24h change, a metrics Details view, secure remember/replace/forget controls, automatic saved-key reconnect, timestamp-preserving offline catalog cache and a bounded archive of observed polling snapshots. The owner requested a 30-second default and saved cadence, with six-hour name refreshes, request estimates and persisted rate-limit/authentication backoff. Settings explains that continuous 30-second monitoring exceeds the Free plan's monthly credits. Transient outages continue automatic recovery with delays capped at one hour, while provider Retry-After waits and rejected credentials remain respected. Cached data cannot trigger alerts. The 180-second freshness guard remains; provider delays and outages can pause alerts. David independently verified authenticated startup/restart with 128 non-root subnets and current price/change/liquidity/volume fields; real trading remains outside this increment.
 
 After the monitor and alerts work reliably, add a realistic virtual-money simulator, train/evaluate AI trading candidates, and run multiple competing agents with separate virtual portfolios. Select agents through repeatable evaluation on unseen data and live paper trading, using returns, risk, costs, and reliability. Live execution remains a later, separately authorized stage.
 
